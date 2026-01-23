@@ -2,7 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
-const { Document, Packer, Paragraph, TextRun, HeadingLevel } = require('docx');
+const { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType } = require('docx');
 
 const router = express.Router();
 
@@ -160,7 +160,7 @@ router.post('/convert', upload.single('markdownFile'), async (req, res) => {
 
 // Markdown转Word转换函数
 async function convertMarkdownToDocx(markdownContent) {
-  // 将Markdown转换为docx段落
+  // 将Markdown转换为docx元素
   const children = parseMarkdownToDocx(markdownContent);
   
   // 创建Word文档
@@ -179,13 +179,25 @@ async function convertMarkdownToDocx(markdownContent) {
 function parseMarkdownToDocx(content) {
   const lines = content.split('\n');
   const children = [];
+  let i = 0;
   
-  for (let i = 0; i < lines.length; i++) {
+  while (i < lines.length) {
     const line = lines[i].trim();
     
     if (!line) {
       // 空行
       children.push(new Paragraph({ text: '' }));
+      i++;
+      continue;
+    }
+    
+    // 检查是否是表格行（包含|符号的行）
+    const nextLine = i + 1 < lines.length ? lines[i + 1].trim() : '';
+    if (isTableHeader(line) && isTableSeparator(nextLine)) {
+      // 找到表格，解析整个表格
+      const tableData = parseTable(lines, i);
+      children.push(tableData.table);
+      i = tableData.nextLineIndex; // 跳过已处理的表格行
       continue;
     }
     
@@ -262,6 +274,7 @@ function parseMarkdownToDocx(content) {
         codeLines.push(lines[i]);
         i++;
       }
+      i++; // 跳过结束标记行
       const codeText = codeLines.join('\n');
       children.push(new Paragraph({
         text: codeText,
@@ -276,9 +289,116 @@ function parseMarkdownToDocx(content) {
         children: runs
       }));
     }
+    i++;
   }
   
   return children;
+}
+
+// 检查是否是表格头部
+function isTableHeader(line) {
+  return line.startsWith('|') && line.endsWith('|');
+}
+
+// 检查是否是表格分隔符行
+function isTableSeparator(line) {
+  // 分隔符行通常由|, -, :组成，例如: |---|:---:|---:|
+  return line.startsWith('|') && line.endsWith('|') && /^[\|\-:\s]+$/.test(line);
+}
+
+// 解析表格
+function parseTable(lines, startIndex) {
+  const headerLine = lines[startIndex];
+  const separatorLine = lines[startIndex + 1];
+  const headerCells = parseTableCells(headerLine);
+  
+  // 解析分隔符行获取对齐信息
+  const alignmentInfo = parseAlignment(separatorLine);
+  
+  // 创建表格
+  const rows = [];
+  
+  // 添加表头行
+  const headerRow = new TableRow({
+    children: headerCells.map((cell, idx) => {
+      const runs = parseInlineFormatting(cell.trim());
+      return new TableCell({
+        children: [new Paragraph({ children: runs })],
+        width: {
+          size: 1000, // 平均分配宽度
+          type: WidthType.PERCENTAGE
+        }
+      });
+    })
+  });
+  rows.push(headerRow);
+  
+  // 解析数据行
+  let i = startIndex + 2;
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    if (!line) {
+      // 空行则结束表格解析
+      break;
+    }
+    if (!isTableHeader(line)) {
+      // 不是表格行，则结束表格解析
+      break;
+    }
+    
+    const dataCells = parseTableCells(line);
+    const dataRow = new TableRow({
+      children: dataCells.map((cell, idx) => {
+        const runs = parseInlineFormatting(cell.trim());
+        return new TableCell({
+          children: [new Paragraph({ children: runs })],
+          width: {
+            size: 1000, // 平均分配宽度
+            type: WidthType.PERCENTAGE
+          }
+        });
+      })
+    });
+    rows.push(dataRow);
+    i++;
+  }
+  
+  const table = new Table({
+    rows: rows
+  });
+  
+  return {
+    table: table,
+    nextLineIndex: i
+  };
+}
+
+// 解析表格单元格
+function parseTableCells(line) {
+  // 移除首尾的|符号
+  const trimmedLine = line.replace(/^\|+/, '').replace(/\|+$/, '');
+  // 按|分割，但要处理转义的|符号
+  return trimmedLine.split(/\|(?![^`]*`)/);
+}
+
+// 解析对齐信息
+function parseAlignment(separatorLine) {
+  const separators = parseTableCells(separatorLine);
+  return separators.map(sep => {
+    sep = sep.trim();
+    const startsWithColon = sep.startsWith(':');
+    const endsWithColon = sep.endsWith(':');
+    
+    if (startsWithColon && endsWithColon) {
+      return 'center'; // 居中对齐
+    } else if (startsWithColon) {
+      return 'left';   // 左对齐
+    } else if (endsWithColon) {
+      return 'right';  // 右对齐
+    } else {
+      return 'left';   // 默认左对齐
+    }
+  });
 }
 
 // 解析内联格式（粗体、斜体、代码等）
@@ -325,7 +445,7 @@ function parseInlineFormatting(text) {
     });
   }
   
-  // 斜体标记（避免与粗体重叠）
+  // 斜体标记
   while ((match = italicRegex.exec(text)) !== null) {
     const start = match.index;
     const end = start + match[0].length;
@@ -421,4 +541,3 @@ function parseInlineFormatting(text) {
 }
 
 module.exports = router;
-
