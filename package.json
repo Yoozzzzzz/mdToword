@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js --port 3009",
-    "dev": "nodemon server.js --port 3009"
+    "dev": "nodemon server.js --port 3009",
+    "test": "node tests/export-style.test.js"
   },
   "keywords": [
     "markdown",

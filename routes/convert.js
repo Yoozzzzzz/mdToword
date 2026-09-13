@@ -2,7 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
-const { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType } = require('docx');
+const { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, WidthType, Footer, PageNumber, LineRuleType, VerticalAlign, convertMillimetersToTwip } = require('docx');
 
 const router = express.Router();
 
@@ -158,141 +158,140 @@ router.post('/convert', upload.single('markdownFile'), async (req, res) => {
   }
 });
 
-// Markdown转Word转换函数
+// 固定报告规范，详见 DOCUMENT_STYLE.md。字号为半磅，距离为 twip。
+const BODY_FONT = '仿宋_GB2312';
+const spacing = (before = 0, after = 0) => ({
+  line: 440, lineRule: LineRuleType.EXACTLY,
+  before: Math.round(before * 440), after: Math.round(after * 440)
+});
+const reportStyles = [
+  ['ReportBody', '正文', BODY_FONT, 24, false, 'left', 0, 0],
+  ['ReportTitle', '文档大标题', '黑体', 44, false, 'center', 0, 1],
+  ['ReportSubtitle', '报告副标题', '黑体', 30, false, 'center', 0, 0.8],
+  ['ReportHeading1', '一级标题', '黑体', 32, false, 'left', 0.8, 0.5],
+  ['ReportHeading2', '二级标题', '黑体', 28, false, 'left', 0.5, 0.3],
+  ['ReportHeading3', '三级标题', '楷体_GB2312', 28, true, 'left', 0.3, 0],
+  ['ReportHeading4', '四级列表项目标题', BODY_FONT, 24, true, 'left', 0, 0],
+  ['ReportCaption', '表格标题', '黑体', 21, false, 'center', 0, 0],
+  ['ReportTableHeader', '表头', '黑体', 21, false, 'center', 0, 0],
+  ['ReportTableBody', '表格内容', BODY_FONT, 21, false, 'left', 0, 0],
+  ['ReportNote', '表下注释', BODY_FONT, 21, false, 'left', 0, 0],
+  ['ReportPageNumber', '页码', '宋体', 21, false, 'center', 0, 0]
+].map(([id, name, font, size, bold, alignment, before, after]) => ({
+  id, name,
+  run: { font: { name: font, eastAsia: font }, size, bold, color: '000000' },
+  paragraph: {
+    alignment, spacing: spacing(before, after),
+    // 小四号为 12 磅，首行 24 磅即两个汉字宽度。
+    indent: { firstLine: id === 'ReportBody' ? 480 : 0 },
+    ...(/^ReportHeading/.test(id) ? { outlineLevel: Number(id.slice(-1)) - 1 } : {})
+  }
+}));
+
 async function convertMarkdownToDocx(markdownContent) {
-  // 将Markdown转换为docx元素
-  const children = parseMarkdownToDocx(markdownContent);
-  
-  // 创建Word文档
   const doc = new Document({
+    styles: {
+      default: { document: {
+        run: { font: { name: BODY_FONT, eastAsia: BODY_FONT }, size: 24, color: '000000' },
+        paragraph: { spacing: spacing() }
+      } },
+      paragraphStyles: reportStyles
+    },
     sections: [{
-      properties: {},
-      children: children
+      properties: { page: {
+        size: { width: convertMillimetersToTwip(210), height: convertMillimetersToTwip(297) },
+        margin: { top: 1440, bottom: 1440,
+          left: convertMillimetersToTwip(28), right: convertMillimetersToTwip(26), footer: 720 }
+      } },
+      footers: { default: new Footer({ children: [new Paragraph({
+        style: 'ReportPageNumber', children: [new TextRun({ children: [PageNumber.CURRENT] })]
+      })] }) },
+      children: parseMarkdownToDocx(markdownContent)
     }]
   });
-  
-  // 生成Buffer
-  return await Packer.toBuffer(doc);
+  return Packer.toBuffer(doc);
 }
 
-// 解析Markdown内容为docx元素
+function reportParagraph(text, style = 'ReportBody', options = {}) {
+  return new Paragraph({ style, children: parseInlineFormatting(text), ...options });
+}
+
 function parseMarkdownToDocx(content) {
-  const lines = content.split('\n');
+  const lines = content.replace(/\uFF5C/g, '|').split('\n');
   const children = [];
+  let hasTitle = false;
+  let afterTable = false;
   let i = 0;
-  
   while (i < lines.length) {
-    const line = lines[i].trim();
-    
-    if (!line) {
-      // 空行
-      children.push(new Paragraph({ text: '' }));
+    const rawLine = lines[i].trim();
+    // Word/AI 生成的 Markdown 常把标题误写成 ▪、• 或 · 开头；它们不是报告列表。
+    const line = rawLine.replace(/^[▪•·]\s*/, '');
+    if (!line) { i++; continue; }
+    // Markdown 分隔线不是报告正文。
+    if (/^(?:[-*_])(?:\s*[-*_]){2,}$/.test(line)) { i++; continue; }
+    if (isTableHeader(line) && isTableSeparator((lines[i + 1] || '').trim())) {
+      const result = parseTable(lines, i);
+      children.push(result.table);
+      i = result.nextLineIndex;
+      afterTable = true;
+      continue;
+    }
+    if (line.startsWith('```')) {
+      i++;
+      while (i < lines.length && !lines[i].trim().startsWith('```')) {
+        // 代码保留原文，字体和行距仍遵守报告规范。
+        children.push(new Paragraph({ style: 'ReportBody', text: lines[i++] }));
+      }
+      if (i < lines.length) i++;
+      afterTable = false;
+      continue;
+    }
+    const heading = line.match(/^(#{1,6})\s+(.+?)(?:\s+#+)?$/);
+    const text = heading ? heading[2] : line;
+    const plain = text.replace(/\*\*|__/g, '').trim();
+    let next = i + 1;
+    while (next < lines.length && !lines[next].trim()) next++;
+    const beforeTable = isTableHeader((lines[next] || '').trim()) &&
+      isTableSeparator((lines[next + 1] || '').trim());
+    // “《项目》项目验收报告”是常见的合并标题写法，拆成规范的两段。
+    const mergedTitle = plain.match(/^(.+?)\s*项目验收报告$/);
+    if (mergedTitle && !hasTitle && !beforeTable) {
+      children.push(reportParagraph(mergedTitle[1].trim(), 'ReportTitle'));
+      children.push(reportParagraph('项目验收报告', 'ReportSubtitle'));
+      hasTitle = true;
+    } else if (plain === '项目验收报告') {
+      children.push(reportParagraph(text, 'ReportSubtitle'));
+    } else if (/^表\s*[0-9一二三四五六七八九十]+/.test(plain) && beforeTable) {
+      children.push(reportParagraph(text, 'ReportCaption'));
+    } else if (afterTable && /^(?:注|说明|备注)(?:[：:]|\s|$)/.test(plain)) {
+      children.push(reportParagraph(text, 'ReportNote'));
       i++;
       continue;
-    }
-    
-    // 检查是否是表格行（包含|符号的行）
-    const nextLine = i + 1 < lines.length ? lines[i + 1].trim() : '';
-    if (isTableHeader(line) && isTableSeparator(nextLine)) {
-      // 找到表格，解析整个表格
-      const tableData = parseTable(lines, i);
-      children.push(tableData.table);
-      i = tableData.nextLineIndex; // 跳过已处理的表格行
-      continue;
-    }
-    
-    // 标题处理（支持标题中的内联格式）
-    if (line.startsWith('# ')) {
-      const titleText = line.substring(2);
-      const runs = parseInlineFormatting(titleText);
-      children.push(new Paragraph({
-        children: runs,
-        heading: HeadingLevel.HEADING_1
-      }));
-    } else if (line.startsWith('## ')) {
-      const titleText = line.substring(3);
-      const runs = parseInlineFormatting(titleText);
-      children.push(new Paragraph({
-        children: runs,
-        heading: HeadingLevel.HEADING_2
-      }));
-    } else if (line.startsWith('### ')) {
-      const titleText = line.substring(4);
-      const runs = parseInlineFormatting(titleText);
-      children.push(new Paragraph({
-        children: runs,
-        heading: HeadingLevel.HEADING_3
-      }));
-    } else if (line.startsWith('#### ')) {
-      const titleText = line.substring(5);
-      const runs = parseInlineFormatting(titleText);
-      children.push(new Paragraph({
-        children: runs,
-        heading: HeadingLevel.HEADING_4
-      }));
-    } else if (line.startsWith('##### ')) {
-      const titleText = line.substring(6);
-      const runs = parseInlineFormatting(titleText);
-      children.push(new Paragraph({
-        children: runs,
-        heading: HeadingLevel.HEADING_5
-      }));
-    } else if (line.startsWith('###### ')) {
-      const titleText = line.substring(7);
-      const runs = parseInlineFormatting(titleText);
-      children.push(new Paragraph({
-        children: runs,
-        heading: HeadingLevel.HEADING_6
-      }));
-    } else if (line.startsWith('- ') || line.startsWith('* ') || /^\d+\.\s/.test(line)) {
-      // 列表项
-      const listText = line.replace(/^[-*]\s+/, '').replace(/^\d+\.\s+/, '');
-      // 处理列表项中的内联格式（粗体、斜体等）
-      const runs = parseInlineFormatting(listText);
-      children.push(new Paragraph({
-        children: runs,
-        bullet: {
-          level: 0
-        }
-      }));
-    } else if (line.startsWith('> ')) {
-      // 引用
-      const quoteText = line.substring(2);
-      // 处理引用中的内联格式
-      const runs = parseInlineFormatting(quoteText);
-      children.push(new Paragraph({
-        children: runs,
-        indent: {
-          left: 720 // 0.5 inch
-        }
-      }));
-    } else if (line.startsWith('```')) {
-      // 代码块开始，收集代码块内容
-      const codeLines = [];
-      i++; // 跳过代码块标记行
-      while (i < lines.length && !lines[i].trim().startsWith('```')) {
-        codeLines.push(lines[i]);
-        i++;
+    } else if (/^[一二三四五六七八九十百]+[、．.]/.test(plain)) {
+      children.push(reportParagraph(text, 'ReportHeading1'));
+    } else if (/^[（(][一二三四五六七八九十百]+[）)]/.test(plain)) {
+      children.push(reportParagraph(text, 'ReportHeading2'));
+    } else if (heading) {
+      if (heading[1].length === 1 && !hasTitle) {
+        children.push(reportParagraph(text, 'ReportTitle'));
+        hasTitle = true;
+      } else {
+        const level = /^\d+[.、．]/.test(plain)
+          ? 3 : Math.min(4, Math.max(1, heading[1].length - 1));
+        children.push(reportParagraph(text, `ReportHeading${level}`));
       }
-      i++; // 跳过结束标记行
-      const codeText = codeLines.join('\n');
-      children.push(new Paragraph({
-        text: codeText,
-        spacing: {
-          after: 200
-        }
-      }));
+    } else if (/^[-*]\s+|^\d+[.、．]\s+/.test(line)) {
+      // 报告中的无序列表通常是“项目名称/承担单位”字段，不输出额外项目符号。
+      // 有序列表保留原编号，统一采用四级列表项目标题样式。
+      const listText = line.replace(/^[-*]\s+/, '').replace(/^(\d+)[.、．]\s+/, '$1. ');
+      children.push(reportParagraph(listText, 'ReportHeading4'));
     } else {
-      // 普通段落，处理内联格式
-      const runs = parseInlineFormatting(line);
-      children.push(new Paragraph({
-        children: runs
-      }));
+      children.push(reportParagraph(line.replace(/^>\s*/, '')));
     }
+    afterTable = false;
     i++;
   }
-  
-  return children;
+  return children.length ? children : [reportParagraph('')];
 }
 
 // 检查是否是表格头部
@@ -309,96 +308,54 @@ function isTableSeparator(line) {
 // 解析表格
 function parseTable(lines, startIndex) {
   const headerLine = lines[startIndex];
-  const separatorLine = lines[startIndex + 1];
   const headerCells = parseTableCells(headerLine);
-  
-  // 解析分隔符行获取对齐信息
-  const alignmentInfo = parseAlignment(separatorLine);
-  
-  // 创建表格
-  const rows = [];
-  
-  // 添加表头行
-  const headerRow = new TableRow({
-    children: headerCells.map((cell, idx) => {
-      const runs = parseInlineFormatting(cell.trim());
+  const createRow = (cells, header = false) => new TableRow({
+    tableHeader: header,
+    children: cells.map(cell => {
+      const value = cell.trim();
+      const numeric = /^[+−-]?(?:[¥￥$]\s*)?\d+(?:[,，]\d{3})*(?:[.．]\d+)?\s*[%％]?$/.test(
+        value.replace(/\*\*|__|`/g, '')
+      );
       return new TableCell({
-        children: [new Paragraph({ children: runs })],
-        width: {
-          size: 1000, // 平均分配宽度
-          type: WidthType.PERCENTAGE
-        }
+        verticalAlign: VerticalAlign.CENTER,
+        width: { size: 100 / headerCells.length, type: WidthType.PERCENTAGE },
+        children: [reportParagraph(value, header ? 'ReportTableHeader' : 'ReportTableBody', {
+          alignment: header || numeric ? 'center' : 'left'
+        })]
       });
     })
   });
-  rows.push(headerRow);
-  
-  // 解析数据行
+  const rows = [createRow(headerCells, true)];
   let i = startIndex + 2;
-  while (i < lines.length) {
-    const line = lines[i].trim();
-    if (!line) {
-      // 空行则结束表格解析
-      break;
-    }
-    if (!isTableHeader(line)) {
-      // 不是表格行，则结束表格解析
-      break;
-    }
-    
-    const dataCells = parseTableCells(line);
-    const dataRow = new TableRow({
-      children: dataCells.map((cell, idx) => {
-        const runs = parseInlineFormatting(cell.trim());
-        return new TableCell({
-          children: [new Paragraph({ children: runs })],
-          width: {
-            size: 1000, // 平均分配宽度
-            type: WidthType.PERCENTAGE
-          }
-        });
-      })
-    });
-    rows.push(dataRow);
+  while (i < lines.length && isTableHeader(lines[i].trim())) {
+    rows.push(createRow(parseTableCells(lines[i].trim())));
     i++;
   }
-  
-  const table = new Table({
-    rows: rows
-  });
-  
   return {
-    table: table,
+    table: new Table({ rows, width: { size: 100, type: WidthType.PERCENTAGE } }),
     nextLineIndex: i
   };
 }
 
 // 解析表格单元格
 function parseTableCells(line) {
+  // 将全角竖线 ｜(U+FF5C) 统一为半角 |，避免无法分割
+  const normalizedLine = line.trim().replace(/\uFF5C/g, '|');
   // 移除首尾的|符号
-  const trimmedLine = line.replace(/^\|+/, '').replace(/\|+$/, '');
-  // 按|分割，但要处理转义的|符号
-  return trimmedLine.split(/\|(?![^`]*`)/);
+  const trimmedLine = normalizedLine.replace(/^\|+/, '').replace(/\|+$/, '');
+  // 按|分割；原正则 (?! [^`]* `) 在单元格含反引号时会误判导致整行落入第一格，改为简单分割
+  return trimmedLine.split('|').map(cell => cell.trim()).filter((cell, index, cells) =>
+    !(index === cells.length - 1 && cell === '')
+  );
 }
 
-// 解析对齐信息
-function parseAlignment(separatorLine) {
-  const separators = parseTableCells(separatorLine);
-  return separators.map(sep => {
-    sep = sep.trim();
-    const startsWithColon = sep.startsWith(':');
-    const endsWithColon = sep.endsWith(':');
-    
-    if (startsWithColon && endsWithColon) {
-      return 'center'; // 居中对齐
-    } else if (startsWithColon) {
-      return 'left';   // 左对齐
-    } else if (endsWithColon) {
-      return 'right';  // 右对齐
-    } else {
-      return 'left';   // 默认左对齐
-    }
-  });
+// 只转换展示文字；代码、网址、邮箱和数字内部标点保留，避免改变技术数据。
+function chinesePunctuation(text) {
+  const punctuation = { ',': '，', ':': '：', ';': '；', '!': '！', '?': '？',
+    '(': '（', ')': '）', '[': '【', ']': '】', '.': '。' };
+  return text.replace(/https?:\/\/[^\s<>，。；！？）]+|[\w.+-]+@[\w.-]+\.[a-z]+|\d+(?:[.,]\d+)+|[,:;!?()\[\]]|\.(?!\s)|"([^"\n]*)"|'([^'\n]*)'/gi,
+    (match, doubleQuote, singleQuote) => doubleQuote !== undefined ? `“${chinesePunctuation(doubleQuote)}”` :
+      singleQuote !== undefined ? `‘${chinesePunctuation(singleQuote)}’` : punctuation[match] || match);
 }
 
 // 解析内联格式（粗体、斜体、代码等）
@@ -500,7 +457,7 @@ function parseInlineFormatting(text) {
     if (marker.start > pos) {
       const plainText = text.substring(pos, marker.start);
       if (plainText) {
-        runs.push(new TextRun(plainText));
+        runs.push(new TextRun(chinesePunctuation(plainText)));
       }
     }
     
@@ -510,14 +467,13 @@ function parseInlineFormatting(text) {
       options.bold = true;
     } else if (marker.type === 'italic') {
       options.italics = true;
-    } else if (marker.type === 'code') {
-      options.font = 'Courier New';
+
     } else if (marker.type === 'strikethrough') {
       options.strike = true;
     }
     
     runs.push(new TextRun({
-      text: marker.content,
+      text: marker.type === 'code' ? marker.content : chinesePunctuation(marker.content),
       ...options
     }));
     
@@ -528,16 +484,17 @@ function parseInlineFormatting(text) {
   if (pos < text.length) {
     const plainText = text.substring(pos);
     if (plainText) {
-      runs.push(new TextRun(plainText));
+      runs.push(new TextRun(chinesePunctuation(plainText)));
     }
   }
   
   // 如果没有找到任何格式标记，返回普通文本
   if (runs.length === 0) {
-    runs.push(new TextRun(text));
+    runs.push(new TextRun(chinesePunctuation(text)));
   }
   
   return runs;
 }
 
 module.exports = router;
+module.exports.convertMarkdownToDocx = convertMarkdownToDocx;
