@@ -213,7 +213,10 @@ async function convertMarkdownToDocx(markdownContent) {
 }
 
 function reportParagraph(text, style = 'ReportBody', options = {}) {
-  return new Paragraph({ style, children: parseInlineFormatting(text), ...options });
+  const parts = String(text).split(/<br\s*\/?>/gi);
+  return new Paragraph({ style, children: parts.flatMap((part, index) =>
+    index ? [new TextRun({ text: part, break: 1 })] : parseInlineFormatting(part)
+  ), ...options });
 }
 
 function parseMarkdownToDocx(content) {
@@ -358,6 +361,11 @@ function chinesePunctuation(text) {
       singleQuote !== undefined ? `‘${chinesePunctuation(singleQuote)}’` : punctuation[match] || match);
 }
 
+function makeTextRun(text, options = {}) {
+  // docx 将 TextRun 的换行文本序列化为 w:br。
+  return new TextRun({ ...options, text: String(text).replace(/<br\s*\/?>/gi, '\n') });
+}
+
 // 解析内联格式（粗体、斜体、代码等）
 function parseInlineFormatting(text) {
   const runs = [];
@@ -457,7 +465,7 @@ function parseInlineFormatting(text) {
     if (marker.start > pos) {
       const plainText = text.substring(pos, marker.start);
       if (plainText) {
-        runs.push(new TextRun(chinesePunctuation(plainText)));
+        runs.push(makeTextRun(chinesePunctuation(plainText)));
       }
     }
     
@@ -472,10 +480,7 @@ function parseInlineFormatting(text) {
       options.strike = true;
     }
     
-    runs.push(new TextRun({
-      text: marker.type === 'code' ? marker.content : chinesePunctuation(marker.content),
-      ...options
-    }));
+    runs.push(makeTextRun(marker.type === 'code' ? marker.content : chinesePunctuation(marker.content), options));
     
     pos = marker.end;
   }
@@ -484,13 +489,13 @@ function parseInlineFormatting(text) {
   if (pos < text.length) {
     const plainText = text.substring(pos);
     if (plainText) {
-      runs.push(new TextRun(chinesePunctuation(plainText)));
+      runs.push(makeTextRun(chinesePunctuation(plainText)));
     }
   }
   
   // 如果没有找到任何格式标记，返回普通文本
   if (runs.length === 0) {
-    runs.push(new TextRun(chinesePunctuation(text)));
+    runs.push(makeTextRun(chinesePunctuation(text)));
   }
   
   return runs;
