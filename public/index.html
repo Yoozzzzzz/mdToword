@@ -280,24 +280,37 @@
         handleFile(e.target.files[0]);
       });
 
-      // 拖拽上传
-      document.addEventListener("dragover", (e) => {
+      // 拖拽上传：只在上传区域接收文件，避免页面其他区域吞掉 drop 事件。
+      uploadArea.addEventListener("dragenter", (e) => {
         e.preventDefault();
         uploadArea.classList.add("dragover");
       });
-
-      document.addEventListener("dragleave", () => {
-        uploadArea.classList.remove("dragover");
-      });
-
-      document.addEventListener("drop", (e) => {
+      uploadArea.addEventListener("dragover", (e) => {
         e.preventDefault();
-        uploadArea.classList.remove("dragover");
-        const file = e.dataTransfer.files[0];
-        if (file) {
-          handleFile(file);
+        e.dataTransfer.dropEffect = "copy";
+        uploadArea.classList.add("dragover");
+      });
+      uploadArea.addEventListener("dragleave", (e) => {
+        if (!e.relatedTarget || !uploadArea.contains(e.relatedTarget)) {
+          uploadArea.classList.remove("dragover");
         }
       });
+      uploadArea.addEventListener("drop", (e) => {
+        e.preventDefault();
+        uploadArea.classList.remove("dragover");
+        handleFile(e.dataTransfer.files[0]);
+      });
+      // 某些浏览器从系统文件管理器拖入时，drop 目标会落在 document；捕获阶段兜底接收。
+      document.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+      }, true);
+      document.addEventListener("drop", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const file = e.dataTransfer && e.dataTransfer.files[0];
+        if (file) handleFile(file);
+      }, true);
       // 处理文件
       function handleFile(file) {
         if (!file) return;

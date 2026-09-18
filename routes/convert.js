@@ -219,6 +219,20 @@ function reportParagraph(text, style = 'ReportBody', options = {}) {
   ), ...options });
 }
 
+function codeParagraph(text) {
+  return new Paragraph({
+    children: [new TextRun({
+      text,
+      font: { name: 'Consolas', eastAsia: '等线' },
+      size: 20,
+      color: '24292F'
+    })],
+    spacing: { line: 280, before: 0, after: 0 },
+    indent: { left: 360, right: 360 },
+    shading: { fill: 'F3F4F6' }
+  });
+}
+
 function parseMarkdownToDocx(content) {
   const lines = content.replace(/\uFF5C/g, '|').split('\n');
   const children = [];
@@ -226,7 +240,17 @@ function parseMarkdownToDocx(content) {
   let afterTable = false;
   let i = 0;
   while (i < lines.length) {
-    const rawLine = lines[i].trim();
+    const sourceLine = lines[i].replace(/\r$/, '');
+    const rawLine = sourceLine.trim();
+    if (rawLine.startsWith('```')) {
+      i++;
+      while (i < lines.length && !lines[i].trim().startsWith('```')) {
+        children.push(codeParagraph(lines[i++].replace(/\r$/, '')));
+      }
+      if (i < lines.length) i++;
+      afterTable = false;
+      continue;
+    }
     // Word/AI 生成的 Markdown 常把标题误写成 ▪、• 或 · 开头；它们不是报告列表。
     const line = rawLine.replace(/^[▪•·]\s*/, '');
     if (!line) { i++; continue; }
@@ -237,16 +261,6 @@ function parseMarkdownToDocx(content) {
       children.push(result.table);
       i = result.nextLineIndex;
       afterTable = true;
-      continue;
-    }
-    if (line.startsWith('```')) {
-      i++;
-      while (i < lines.length && !lines[i].trim().startsWith('```')) {
-        // 代码保留原文，字体和行距仍遵守报告规范。
-        children.push(new Paragraph({ style: 'ReportBody', text: lines[i++] }));
-      }
-      if (i < lines.length) i++;
-      afterTable = false;
       continue;
     }
     const heading = line.match(/^(#{1,6})\s+(.+?)(?:\s+#+)?$/);
