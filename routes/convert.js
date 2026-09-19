@@ -2,7 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
-const { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, WidthType, Footer, PageNumber, LineRuleType, VerticalAlign, convertMillimetersToTwip } = require('docx');
+const { Document, Packer, Paragraph, TextRun, Tab, TabStopType, Table, TableRow, TableCell, WidthType, Footer, PageNumber, LineRuleType, VerticalAlign, convertMillimetersToTwip } = require('docx');
 
 const router = express.Router();
 
@@ -160,16 +160,18 @@ router.post('/convert', upload.single('markdownFile'), async (req, res) => {
 
 // 固定报告规范，详见 DOCUMENT_STYLE.md。字号为半磅，距离为 twip。
 const BODY_FONT = '仿宋_GB2312';
-const spacing = (before = 0, after = 0) => ({
-  line: 440, lineRule: LineRuleType.EXACTLY,
+const spacing = (before = 0, after = 0, line = 440, lineRule = LineRuleType.EXACTLY) => ({
+  line, lineRule,
   before: Math.round(before * 440), after: Math.round(after * 440)
 });
 const reportStyles = [
   ['ReportBody', '正文', BODY_FONT, 24, false, 'left', 0, 0],
+  ['ReportList', '无序列表', BODY_FONT, 24, false, 'left', 0, 0],
+  ['ReportOrderedList', '有序列表', BODY_FONT, 24, false, 'left', 0, 0],
   ['ReportTitle', '文档大标题', '黑体', 44, false, 'center', 0, 1],
   ['ReportSubtitle', '报告副标题', '黑体', 30, false, 'center', 0, 0.8],
   ['ReportHeading1', '一级标题', '黑体', 32, false, 'left', 0.8, 0.5],
-  ['ReportHeading2', '二级标题', '黑体', 28, false, 'left', 0.5, 0.3],
+  ['ReportHeading2', '二级标题', '黑体', 28, false, 'left', 0.2, 0.1],
   ['ReportHeading3', '三级标题', '楷体_GB2312', 28, true, 'left', 0.3, 0],
   ['ReportHeading4', '四级列表项目标题', BODY_FONT, 24, true, 'left', 0, 0],
   ['ReportCaption', '表格标题', '黑体', 21, false, 'center', 0, 0],
@@ -181,7 +183,10 @@ const reportStyles = [
   id, name,
   run: { font: { name: font, eastAsia: font }, size, bold, color: '000000' },
   paragraph: {
-    alignment, spacing: spacing(before, after),
+    alignment,
+    spacing: id === 'ReportBody' || id === 'ReportOrderedList'
+      ? spacing(before, after, 360, LineRuleType.AUTO)
+      : spacing(before, after),
     // 小四号为 12 磅，首行 24 磅即两个汉字宽度。
     indent: { firstLine: id === 'ReportBody' ? 480 : 0 },
     ...(/^ReportHeading/.test(id) ? { outlineLevel: Number(id.slice(-1)) - 1 } : {})
@@ -297,11 +302,19 @@ function parseMarkdownToDocx(content) {
           ? 3 : Math.min(4, Math.max(1, heading[1].length - 1));
         children.push(reportParagraph(text, `ReportHeading${level}`));
       }
-    } else if (/^[-*]\s+|^\d+[.、．]\s+/.test(line)) {
-      // 报告中的无序列表通常是“项目名称/承担单位”字段，不输出额外项目符号。
-      // 有序列表保留原编号，统一采用四级列表项目标题样式。
-      const listText = line.replace(/^[-*]\s+/, '').replace(/^(\d+)[.、．]\s+/, '$1. ');
-      children.push(reportParagraph(listText, 'ReportHeading4'));
+    } else if (/^[-*+]\s+/.test(line)) {
+      children.push(reportParagraph(line.replace(/^[-*+]\s+/, ''), 'ReportList', {
+        bullet: { level: 0 },
+        indent: { left: 720, hanging: 240 },
+        spacing: { line: 360, lineRule: LineRuleType.EXACTLY, before: 0, after: 0 }
+      }));
+    } else if (/^\d+[.、．]\s+/.test(line)) {
+      const [, number, text] = line.match(/^(\d+)[.、．]\s+([\s\S]*)$/);
+      children.push(reportParagraph(text, 'ReportOrderedList', {
+        indent: { left: 960, hanging: 480 },
+        tabStops: [{ type: TabStopType.LEFT, position: 960 }],
+        children: [new TextRun({ children: [`${number}.`, new Tab()] }), ...parseInlineFormatting(text)]
+      }));
     } else {
       children.push(reportParagraph(line.replace(/^>\s*/, '')));
     }
